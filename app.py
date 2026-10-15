@@ -163,7 +163,7 @@ def load_uploaded_file(file_bytes: bytes, file_name: str, sheet_name: str | None
 def transaction_to_customers(
     source: pd.DataFrame,
     mapping: dict[str, str | None],
-) -> tuple[pd.DataFrame, dict[str, object], pd.DataFrame | None]:
+) -> tuple[pd.DataFrame, dict[str, object], pd.DataFrame | None, pd.DataFrame | None]:
     customer_col = mapping["customer_id"]
     if not customer_col:
         raise ValueError(
@@ -302,7 +302,35 @@ def transaction_to_customers(
     quality["customers_created"] = len(customer)
     quality["spend_definition"] = spend_definition
     quality["categories_inferred_from_description"] = inferred_category
-    return customer, quality, category_report
+    product_report = None
+    if product_col:
+        product_work = work.loc[work[product_col].notna()].copy()
+        product_work["__product_label"] = product_work[product_col].astype("string").str.strip()
+        product_work = product_work.loc[product_work["__product_label"].ne("")]
+        if not product_work.empty:
+            if "__quantity" in product_work:
+                product_work["__units"] = product_work["__quantity"].fillna(0)
+            else:
+                product_work["__units"] = 1
+            aggregations: dict[str, tuple[str, str]] = {
+                "units_sold": ("__units", "sum"),
+                "purchase_lines": ("__product_label", "size"),
+                "distinct_customers": (customer_col, "nunique"),
+            }
+            if "__spend" in product_work and product_work["__spend"].notna().any():
+                aggregations["sales_value"] = ("__spend", "sum")
+            if order_col:
+                aggregations["distinct_orders"] = (order_col, "nunique")
+            if category_col:
+                aggregations["category"] = (category_col, "first")
+            product_report = (
+                product_work.groupby("__product_label", dropna=True)
+                .agg(**aggregations)
+                .sort_values("units_sold", ascending=False)
+                .reset_index(names="product")
+            )
+
+    return customer, quality, category_report, product_report
 
 
 def customer_level_data(
@@ -636,11 +664,12 @@ with tab_setup:
 
     try:
         if grain.startswith("Transaction-level"):
-            customer_data, preparation_quality, category_report = transaction_to_customers(raw_data, mapping)
+            customer_data, preparation_quality, category_report, product_report = transaction_to_customers(raw_data, mapping)
             spend_definition = preparation_quality.get("spend_definition")
         else:
             customer_data, preparation_quality = customer_level_data(raw_data, customer_col)
             category_report = None
+            product_report = None
             spend_definition = None
     except ValueError as exc:
         st.error(str(exc))
@@ -862,6 +891,7 @@ with tab_setup:
                     "summary": summary,
                     "spend_definition": spend_definition,
                     "category_report": category_report,
+                    "product_report": product_report,
                     "quality": preparation_quality,
                 }
         except Exception as exc:
@@ -931,6 +961,16 @@ with tab_results:
         st.caption(
             "Unequal group sizes often reflect real customer behavior. K-means does not promise equal-sized groups."
         )
+        spend_profile_column = f"median_{spend_col}" if spend_col else None
+        if spend_profile_column and spend_profile_column in profiles.columns:
+            st.subheader("Typical customer spend by group")
+            spend_chart = profiles.set_index("segment_name")[spend_profile_column]
+            st.bar_chart(spend_chart, y_label="Median customer spend (uploaded currency)")
+        order_profile_column = f"median_{order_col}" if order_col else None
+        if order_profile_column and order_profile_column in profiles.columns:
+            st.subheader("Typical orders per customer by group")
+            order_chart = profiles.set_index("segment_name")[order_profile_column]
+            st.bar_chart(order_chart, y_label="Median distinct orders")
 
         st.subheader("Customer profile by group")
         display_profile = profiles[["segment_name", *[
@@ -948,6 +988,47 @@ with tab_results:
                     "Review the labels before using them for business decisions."
                 )
             st.dataframe(category_report.head(10), width="stretch", hide_index=True)
+
+        product_report = state.get("product_report")
+        if product_report is not None and not product_report.empty:
+            st.subheader("Popular products")
+            st.caption(
+                "Products are ranked by units sold across the uploaded transactions. "
+                "The chart shows observed purchases, not predicted demand."
+            )
+            ranking_metric = "units_sold"
+            ranking_label = "Units sold"
+            if "sales_value" in product_report.columns:
+                ranking_choice = st.radio(
+                    "Rank products by",
+                    ["Units sold", "Sales value"],
+                    horizontal=True,
+                    key=f"product_rank_{state['signature'][:10]}",
+                )
+                if ranking_choice == "Sales value":
+                    ranking_metric = "sales_value"
+                    ranking_label = "Sales value (uploaded currency)"
+            popular = product_report.nlargest(10, ranking_metric).sort_values(ranking_metric)
+            st.bar_chart(
+                popular.set_index("product")[ranking_metric],
+                x_label="Product",
+                y_label=ranking_label,
+                horizontal=True,
+                height=max(320, 34 * len(popular)),
+            )
+            st.dataframe(
+                product_report.nlargest(10, ranking_metric).round(2),
+                width="stretch",
+                hide_index=True,
+            )
+        elif grain.startswith("Transaction-level"):
+            st.info(
+                "To see popular products, upload transaction rows and map a product name or product ID column."
+            )
+        else:
+            st.info(
+                "Popular products require transaction-level data. Customer-level summaries do not show individual product purchases."
+            )
 
         st.subheader("What each customer group tends to buy")
         if not any(column in customers.columns for column in ("age", "customer_age", "gender", "customer_gender", "income", "household_income")):
@@ -975,6 +1056,46 @@ with tab_results:
             ).fillna(0)
             chart_categories = top_preferences.groupby("Preferred category")["Customers"].sum().nlargest(8).index
             st.bar_chart(preference_chart.reindex(columns=chart_categories, fill_value=0), height=360)
+            st.subheader("Overall customer category preferences")
+            overall_preference = (
+                customers[favorite_category_col]
+                .dropna()
+                .astype(str)
+                .value_counts()
+            )
+            if len(overall_preference) > 8:
+                pie_values = overall_preference.head(7).copy()
+                pie_values.loc["Other categories"] = overall_preference.iloc[7:].sum()
+                overall_preference = pie_values
+            if not overall_preference.empty:
+                import matplotlib.pyplot as plt
+
+                pie_fig, pie_ax = plt.subplots(figsize=(8, 5))
+                pie_ax.pie(
+                    overall_preference.values,
+                    labels=None,
+                    autopct="%1.1f%%",
+                    startangle=90,
+                    pctdistance=0.78,
+                    wedgeprops={"width": 0.42, "edgecolor": "white", "linewidth": 1.5},
+                    textprops={"fontsize": 9},
+                )
+                pie_ax.legend(
+                    overall_preference.index,
+                    title="Most-purchased category",
+                    loc="center left",
+                    bbox_to_anchor=(1.0, 0.5),
+                    frameon=False,
+                )
+                pie_ax.set_title("Customers by most-purchased category")
+                pie_ax.axis("equal")
+                pie_fig.tight_layout()
+                st.pyplot(pie_fig, use_container_width=True)
+                plt.close(pie_fig)
+                st.caption(
+                    "Each customer is counted once, in the category they purchased most often. "
+                    "This is customer preference, not each category's share of total sales."
+                )
         else:
             st.info(
                 "No product category or usable item description was available. Upload transaction rows and map a category or product description column."
