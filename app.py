@@ -10,9 +10,6 @@ import warnings
 import numpy as np
 import pandas as pd
 import streamlit as st
-from sklearn.cluster import KMeans
-from sklearn.metrics import davies_bouldin_score, silhouette_score
-from sklearn.preprocessing import StandardScaler
 
 
 st.set_page_config(
@@ -782,6 +779,11 @@ with tab_setup:
 
     if st.button("Run customer analysis", type="primary", width="stretch"):
         try:
+            # Load the heavier scientific stack only when the user requests clustering.
+            from sklearn.cluster import KMeans
+            from sklearn.metrics import davies_bouldin_score, silhouette_score
+            from sklearn.preprocessing import StandardScaler
+
             with st.spinner("Preparing features, fitting K-means, and building customer profiles…"):
                 scaler = StandardScaler()
                 scaled = scaler.fit_transform(model_features.to_numpy(dtype=np.float64))
